@@ -1,24 +1,31 @@
+import os
 import httpx
 
 
 # ============================================================
-# OLLAMA CONFIGURATION
+# GROQ CONFIGURATION
 # ============================================================
 
-OLLAMA_URL = (
-    "http://localhost:11434/api/generate"
-)
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-OLLAMA_MODEL = "llama3.2:latest"
+GROQ_MODEL = "llama-3.1-8b-instant"
 
 
 # ============================================================
 # GENERATE RESPONSE
 # ============================================================
 
-async def generate_response(
-    prompt: str
-) -> str:
+async def generate_response(prompt: str) -> str:
+
+    api_key = os.getenv("GROQ_API_KEY")
+
+    if not api_key:
+        print("GROQ_API_KEY is not configured.")
+
+        return (
+            "AI service is not configured. "
+            "Please contact the administrator."
+        )
 
     try:
 
@@ -26,12 +33,23 @@ async def generate_response(
 
             response = await client.post(
 
-                OLLAMA_URL,
+                GROQ_URL,
+
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json"
+                },
 
                 json={
-                    "model": OLLAMA_MODEL,
-                    "prompt": prompt,
-                    "stream": False
+                    "model": GROQ_MODEL,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": prompt
+                        }
+                    ],
+                    "temperature": 0.7,
+                    "max_tokens": 500
                 },
 
                 timeout=60.0
@@ -42,23 +60,14 @@ async def generate_response(
             data = response.json()
 
             return (
-                data.get(
-                    "response",
-                    "I'm unable to generate a response right now."
-                )
+                data["choices"][0]["message"]["content"]
                 .strip()
             )
 
 
-    except httpx.ConnectError:
-
-        return (
-            "AI service is offline. "
-            "Please make sure Ollama is running."
-        )
-
-
     except httpx.TimeoutException:
+
+        print("Groq request timed out.")
 
         return (
             "The AI took too long to respond. "
@@ -66,11 +75,23 @@ async def generate_response(
         )
 
 
-    except Exception as e:
+    except httpx.HTTPStatusError as e:
 
         print(
-            f"LLM Error: {e}"
+            f"Groq API error: "
+            f"{e.response.status_code} - "
+            f"{e.response.text}"
         )
+
+        return (
+            "The AI service is temporarily unavailable. "
+            "Please try again."
+        )
+
+
+    except Exception as e:
+
+        print(f"LLM Error: {e}")
 
         return (
             "Something went wrong while "
