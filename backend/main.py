@@ -8,7 +8,9 @@ import time
 import httpx
 
 import models
-from database import get_db
+from database import get_db, engine, Base
+
+Base.metadata.create_all(bind=engine)
 
 from ai.context_engine import (
     build_basic_context,
