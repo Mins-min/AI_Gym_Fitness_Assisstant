@@ -1,3 +1,4 @@
+import { API_URL } from "../api";
 import React, { useEffect, useState } from "react";
 
 export default function GymRecommenderPlanner({
@@ -159,7 +160,7 @@ export default function GymRecommenderPlanner({
 
     try {
       const response = await fetch(
-        "/api/fitness/bmi",
+        `${API_URL}/api/fitness/bmi`,
         {
           method: "POST",
           headers: {
@@ -233,7 +234,7 @@ export default function GymRecommenderPlanner({
       );
 
       const response = await fetch(
-        "/api/gyms/recommend",
+        `${API_URL}/api/gyms/recommend`,
         {
           method: "POST",
           headers: {
