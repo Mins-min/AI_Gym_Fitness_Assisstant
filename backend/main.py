@@ -1,0 +1,2455 @@
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
+import json
+import time
+import httpx
+
+import models
+from database import get_db
+
+from ai.context_engine import (
+    build_basic_context,
+    build_user_context
+)
+
+
+# ============================================================
+# OLLAMA CONFIGURATION
+# ============================================================
+
+OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_MODEL = "llama3.2:latest"
+
+
+async def generate_response(prompt: str) -> str:
+    """
+    Generate an AI response using local Ollama.
+    """
+
+    try:
+        async with httpx.AsyncClient() as client:
+
+            response = await client.post(
+                OLLAMA_URL,
+                json={
+                    "model": OLLAMA_MODEL,
+                    "prompt": prompt,
+                    "stream": False
+                },
+                timeout=120.0
+            )
+
+            response.raise_for_status()
+
+            data = response.json()
+
+            return data.get(
+                "response",
+                "I'm unable to generate a response right now."
+            ).strip()
+
+    except httpx.ConnectError:
+        print("Ollama connection failed.")
+        return (
+            "AI service is offline. "
+            "Please make sure Ollama is running."
+        )
+
+    except httpx.TimeoutException:
+        print("Ollama request timed out.")
+        return (
+            "The AI took too long to respond. "
+            "Please try again."
+        )
+
+    except Exception as e:
+        print(f"LLM Error: {e}")
+        return (
+            "Something went wrong while communicating "
+            "with the AI."
+        )
+
+
+# ============================================================
+# FASTAPI APP
+# ============================================================
+
+app = FastAPI(
+    title="AI Fitness Backend",
+    version="2.0.0"
+)
+
+
+# ============================================================
+# CORS
+# ============================================================
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ============================================================
+# GLOBAL STATE
+# ============================================================
+
+iot_state = {
+    "resistance_level": 5,
+    "intensity": "Moderate",
+    "rest_seconds": 60,
+    "last_adjustment": None
+}
+
+gym_search_cache = {}
+
+CACHE_DURATION = 600
+
+
+# ============================================================
+# REQUEST MODELS
+# ============================================================
+
+class PromptRequest(BaseModel):
+    prompt: str
+
+
+class ChatRequest(BaseModel):
+    username: str
+    message: str
+
+
+class MealRequest(BaseModel):
+    username: str
+    name: str
+    calories: int
+    protein: float = 0
+    carbs: float = 0
+    fats: float = 0
+
+
+class HabitRequest(BaseModel):
+    username: str
+    name: str
+    completed: bool = False
+
+
+class PerformanceRequest(BaseModel):
+    username: str
+    exercise: str
+    score: float
+    motion_efficiency: float
+    completed_reps: int
+    feedback: str = ""
+
+
+class ResistanceRequest(BaseModel):
+    resistance_level: int
+
+
+class BehaviorPredictionRequest(BaseModel):
+    username: str
+    recent_workouts: int = 0
+    missed_workouts: int = 0
+    average_gap_days: float = 0
+    recent_completion_rate: float = 0
+
+
+class BMIRequest(BaseModel):
+    username: str = "guest"
+    weight: float
+    height: float
+
+
+class GymRecommendationRequest(BaseModel):
+    username: str = "guest"
+    goal: str
+    location: str
+    latitude: float | None = None
+    longitude: float | None = None
+
+
+# ============================================================
+# ROOT
+# ============================================================
+
+@app.get("/")
+def root():
+
+    return {
+        "message": "AI Fitness Backend is running",
+        "status": "online"
+    }
+
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
+@app.get("/api/health")
+def health_check():
+
+    return {
+        "status": "healthy",
+        "service": "AI Fitness Backend"
+    }
+
+
+# ============================================================
+# MEALS - GET
+# ============================================================
+
+@app.get("/api/meals")
+def get_meals(
+    username: str,
+    db: Session = Depends(get_db)
+):
+
+    username = username.strip()
+
+    if not username:
+        raise HTTPException(
+            status_code=400,
+            detail="Username is required."
+        )
+
+    meals = (
+        db.query(models.MealModel)
+        .filter(models.MealModel.username == username)
+        .order_by(models.MealModel.id.desc())
+        .all()
+    )
+
+    return [
+        {
+            "id": meal.id,
+            "username": meal.username,
+            "name": meal.name,
+            "calories": meal.calories,
+            "protein": meal.protein,
+            "carbs": meal.carbs,
+            "fats": meal.fats
+        }
+        for meal in meals
+    ]
+
+
+# ============================================================
+# MEALS - ADD
+# ============================================================
+
+@app.post("/api/meals")
+def add_meal(
+    request: MealRequest,
+    db: Session = Depends(get_db)
+):
+
+    username = request.username.strip()
+    name = request.name.strip()
+
+    if not username:
+        raise HTTPException(
+            status_code=400,
+            detail="Username is required."
+        )
+
+    if not name:
+        raise HTTPException(
+            status_code=400,
+            detail="Meal name is required."
+        )
+
+    if request.calories < 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Calories cannot be negative."
+        )
+
+    meal = models.MealModel(
+        username=username,
+        name=name,
+        calories=request.calories,
+        protein=request.protein,
+        carbs=request.carbs,
+        fats=request.fats
+    )
+
+    db.add(meal)
+    db.commit()
+    db.refresh(meal)
+
+    return {
+        "message": "Meal added successfully.",
+        "meal": {
+            "id": meal.id,
+            "username": meal.username,
+            "name": meal.name,
+            "calories": meal.calories,
+            "protein": meal.protein,
+            "carbs": meal.carbs,
+            "fats": meal.fats
+        }
+    }
+
+
+# ============================================================
+# HABITS - GET
+# ============================================================
+
+@app.get("/api/habits")
+def get_habits(
+    username: str,
+    db: Session = Depends(get_db)
+):
+
+    username = username.strip()
+
+    if not username:
+        raise HTTPException(
+            status_code=400,
+            detail="Username is required."
+        )
+
+    habits = (
+        db.query(models.HabitModel)
+        .filter(models.HabitModel.username == username)
+        .order_by(models.HabitModel.id.desc())
+        .all()
+    )
+
+    return [
+        {
+            "id": habit.id,
+            "username": habit.username,
+            "name": habit.name,
+            "completed": habit.completed
+        }
+        for habit in habits
+    ]
+
+
+# ============================================================
+# HABITS - ADD
+# ============================================================
+
+@app.post("/api/habits")
+def add_habit(
+    request: HabitRequest,
+    db: Session = Depends(get_db)
+):
+
+    username = request.username.strip()
+    name = request.name.strip()
+
+    if not username:
+        raise HTTPException(
+            status_code=400,
+            detail="Username is required."
+        )
+
+    if not name:
+        raise HTTPException(
+            status_code=400,
+            detail="Habit name is required."
+        )
+
+    habit = models.HabitModel(
+        username=username,
+        name=name,
+        completed=request.completed
+    )
+
+    db.add(habit)
+    db.commit()
+    db.refresh(habit)
+
+    return {
+        "message": "Habit added successfully.",
+        "habit": {
+            "id": habit.id,
+            "username": habit.username,
+            "name": habit.name,
+            "completed": habit.completed
+        }
+    }
+
+
+# ============================================================
+# HABITS - UPDATE
+# ============================================================
+
+@app.put("/api/habits/{habit_id}")
+def update_habit(
+    habit_id: int,
+    completed: bool,
+    username: str,
+    db: Session = Depends(get_db)
+):
+
+    username = username.strip()
+
+    if not username:
+        raise HTTPException(
+            status_code=400,
+            detail="Username is required."
+        )
+
+    habit = (
+        db.query(models.HabitModel)
+        .filter(
+            models.HabitModel.id == habit_id,
+            models.HabitModel.username == username
+        )
+        .first()
+    )
+
+    if not habit:
+        raise HTTPException(
+            status_code=404,
+            detail="Habit not found."
+        )
+
+    habit.completed = completed
+
+    db.commit()
+    db.refresh(habit)
+
+    return {
+        "message": "Habit updated successfully.",
+        "habit": {
+            "id": habit.id,
+            "username": habit.username,
+            "name": habit.name,
+            "completed": habit.completed
+        }
+    }
+
+
+# ============================================================
+# BMI
+# ============================================================
+
+@app.post("/api/fitness/bmi")
+def calculate_bmi(
+    request: BMIRequest
+):
+
+    if request.weight <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Weight must be greater than zero."
+        )
+
+    if request.height <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Height must be greater than zero."
+        )
+
+    height_m = request.height / 100
+
+    bmi = request.weight / (height_m * height_m)
+
+    if bmi < 18.5:
+        category = "Underweight"
+    elif bmi < 25:
+        category = "Normal weight"
+    elif bmi < 30:
+        category = "Overweight"
+    else:
+        category = "Obesity"
+
+    return {
+        "username": request.username,
+        "weight": request.weight,
+        "height": request.height,
+        "bmi": round(bmi, 2),
+        "category": category
+    }
+
+
+# ============================================================
+# ADVANCED BEHAVIOR PREDICTION
+# ============================================================
+
+@app.post("/api/behavior/advanced-predict")
+async def advanced_behavior_prediction(
+    request: BehaviorPredictionRequest,
+    db: Session = Depends(get_db)
+):
+
+    username = request.username.strip()
+
+    if not username:
+        raise HTTPException(
+            status_code=400,
+            detail="Username is required."
+        )
+
+    habits = (
+        db.query(models.HabitModel)
+        .filter(models.HabitModel.username == username)
+        .all()
+    )
+
+    if habits:
+
+        completed = sum(
+            1 for habit in habits
+            if habit.completed
+        )
+
+        completion_rate = (
+            completed / len(habits)
+        ) * 100
+
+    else:
+        completion_rate = request.recent_completion_rate
+
+    missed = request.missed_workouts
+
+    if completion_rate >= 80 and missed <= 1:
+
+        risk = "Low"
+
+        recommendation = (
+            "Your consistency looks strong. "
+            "Continue following your current routine."
+        )
+
+    elif completion_rate >= 50 and missed <= 3:
+
+        risk = "Moderate"
+
+        recommendation = (
+            "Your consistency could improve. "
+            "Try keeping workouts shorter and "
+            "more manageable."
+        )
+
+    else:
+
+        risk = "High"
+
+        recommendation = (
+            "Your recent pattern suggests you may "
+            "benefit from a simpler and more "
+            "consistent workout schedule."
+        )
+
+    return {
+        "username": username,
+        "skip_risk": risk,
+        "completion_rate": round(
+            completion_rate,
+            1
+        ),
+        "missed_workouts": missed,
+        "recommendation": recommendation
+    }
+
+
+# ============================================================
+# OPENSTREETMAP GYM SEARCH
+# ============================================================
+
+async def find_real_gyms(
+    location: str,
+    latitude: float | None = None,
+    longitude: float | None = None
+):
+
+    global gym_search_cache
+
+    location = location.strip()
+
+    if not location:
+        return []
+
+    cache_key = (
+        f"{location.lower()}|"
+        f"{round(latitude, 5) if latitude is not None else 'none'}|"
+        f"{round(longitude, 5) if longitude is not None else 'none'}"
+    )
+
+    if cache_key in gym_search_cache:
+
+        cached_time, cached_data = (
+            gym_search_cache[cache_key]
+        )
+
+        if time.time() - cached_time < CACHE_DURATION:
+
+            print(
+                f"Using cached gym results for: "
+                f"{location}"
+            )
+
+            return cached_data
+
+    headers = {
+        "User-Agent":
+            "AI-Fitness-Assistant/1.0 "
+            "contact@example.com"
+    }
+
+    try:
+
+        async with httpx.AsyncClient(
+            timeout=30.0,
+            headers=headers
+        ) as client:
+
+            # ------------------------------------------------
+            # GET COORDINATES
+            # ------------------------------------------------
+
+            if latitude is None or longitude is None:
+
+                geocode_response = await client.get(
+                    "https://nominatim.openstreetmap.org/search",
+                    params={
+                        "q": location,
+                        "format": "jsonv2",
+                        "limit": 1,
+                        "countrycodes": "in"
+                    }
+                )
+
+                geocode_response.raise_for_status()
+
+                geocode_data = (
+                    geocode_response.json()
+                )
+
+                if not geocode_data:
+
+                    print(
+                        f"Nominatim could not find: "
+                        f"{location}"
+                    )
+
+                    return []
+
+                search_latitude = float(
+                    geocode_data[0]["lat"]
+                )
+
+                search_longitude = float(
+                    geocode_data[0]["lon"]
+                )
+
+                coordinate_source = "Nominatim"
+
+            else:
+
+                search_latitude = float(latitude)
+                search_longitude = float(longitude)
+
+                coordinate_source = "Browser GPS"
+
+            print(
+                f"Gym search location: {location}"
+            )
+
+            print(
+                f"Coordinates ({coordinate_source}): "
+                f"{search_latitude}, "
+                f"{search_longitude}"
+            )
+
+            # ------------------------------------------------
+            # OVERPASS
+            # ------------------------------------------------
+
+            radius = 25000
+
+            overpass_query = f"""
+[out:json][timeout:60];
+
+(
+  nwr["leisure"="fitness_centre"]
+    (around:{radius},{search_latitude},{search_longitude});
+
+  nwr["sport"="fitness"]
+    (around:{radius},{search_latitude},{search_longitude});
+
+  nwr["amenity"="gym"]
+    (around:{radius},{search_latitude},{search_longitude});
+
+  nwr["leisure"="sports_centre"]
+    (around:{radius},{search_latitude},{search_longitude});
+
+  nwr["sport"="weightlifting"]
+    (around:{radius},{search_latitude},{search_longitude});
+
+  nwr["sport"="crossfit"]
+    (around:{radius},{search_latitude},{search_longitude});
+
+  nwr["sport"="bodybuilding"]
+    (around:{radius},{search_latitude},{search_longitude});
+);
+
+out center tags;
+"""
+
+            overpass_urls = [
+                "https://overpass-api.de/api/interpreter",
+                "https://overpass.kumi.systems/api/interpreter",
+                "https://overpass.private.coffee/api/interpreter"
+            ]
+
+            elements = []
+
+            for overpass_url in overpass_urls:
+
+                try:
+
+                    print(
+                        f"Trying Overpass server: "
+                        f"{overpass_url}"
+                    )
+
+                    response = await client.post(
+                        overpass_url,
+                        content=overpass_query
+                    )
+
+                    response.raise_for_status()
+
+                    data = response.json()
+
+                    elements = data.get(
+                        "elements",
+                        []
+                    )
+
+                    print(
+                        f"Overpass returned "
+                        f"{len(elements)} elements."
+                    )
+
+                    if elements:
+                        break
+
+                except Exception as error:
+
+                    print(
+                        f"Overpass server failed: "
+                        f"{error}"
+                    )
+
+            # ------------------------------------------------
+            # PROCESS RESULTS
+            # ------------------------------------------------
+
+            gyms = []
+            seen_names = set()
+
+            for element in elements:
+
+                tags = element.get(
+                    "tags",
+                    {}
+                )
+
+                name = (
+                    tags.get("name")
+                    or tags.get("brand")
+                    or tags.get("operator")
+                )
+
+                if not name:
+                    continue
+
+                name = name.strip()
+
+                normalized_name = name.lower()
+
+                if normalized_name in seen_names:
+                    continue
+
+                seen_names.add(normalized_name)
+
+                if element.get("lat") is not None:
+
+                    gym_lat = element.get("lat")
+                    gym_lon = element.get("lon")
+
+                else:
+
+                    center = element.get(
+                        "center",
+                        {}
+                    )
+
+                    gym_lat = center.get("lat")
+                    gym_lon = center.get("lon")
+
+                gyms.append({
+                    "name": name,
+                    "latitude": gym_lat,
+                    "longitude": gym_lon,
+                    "operator": tags.get(
+                        "operator"
+                    ),
+                    "brand": tags.get(
+                        "brand"
+                    ),
+                    "opening_hours": tags.get(
+                        "opening_hours"
+                    ),
+                    "phone": (
+                        tags.get("phone")
+                        or tags.get("contact:phone")
+                    ),
+                    "website": (
+                        tags.get("website")
+                        or tags.get("contact:website")
+                    ),
+                    "personal_trainer": tags.get(
+                        "personal_trainer"
+                    ),
+                    "sport": tags.get(
+                        "sport"
+                    ),
+                    "source": "OpenStreetMap"
+                })
+
+            # ------------------------------------------------
+            # NOMINATIM FALLBACK
+            # ------------------------------------------------
+
+            if not gyms:
+
+                print(
+                    "Overpass returned no named gyms."
+                )
+
+                search_queries = [
+                    f"gym near {location}",
+                    f"fitness centre near {location}",
+                    f"fitness center near {location}",
+                    f"fitness near {location}",
+                    f"crossfit near {location}",
+                    f"health club near {location}"
+                ]
+
+                for query in search_queries:
+
+                    try:
+
+                        search_response = await client.get(
+                            "https://nominatim.openstreetmap.org/search",
+                            params={
+                                "q": query,
+                                "format": "jsonv2",
+                                "limit": 20,
+                                "countrycodes": "in"
+                            }
+                        )
+
+                        search_response.raise_for_status()
+
+                        search_data = (
+                            search_response.json()
+                        )
+
+                        for item in search_data:
+
+                            name = (
+                                item.get("name")
+                                or item.get(
+                                    "display_name"
+                                )
+                            )
+
+                            if not name:
+                                continue
+
+                            if (
+                                name.lower()
+                                in seen_names
+                            ):
+                                continue
+
+                            item_type = (
+                                item.get("type")
+                                or ""
+                            ).lower()
+
+                            display_name = (
+                                item.get(
+                                    "display_name",
+                                    ""
+                                )
+                            ).lower()
+
+                            keywords = [
+                                "gym",
+                                "fitness",
+                                "fitness centre",
+                                "fitness center",
+                                "health club",
+                                "crossfit",
+                                "workout"
+                            ]
+
+                            is_fitness = (
+                                any(
+                                    keyword
+                                    in name.lower()
+                                    for keyword
+                                    in keywords
+                                )
+                                or
+                                any(
+                                    keyword
+                                    in display_name
+                                    for keyword
+                                    in keywords
+                                )
+                                or
+                                item_type in [
+                                    "fitness_centre",
+                                    "sports_centre",
+                                    "gym"
+                                ]
+                            )
+
+                            if not is_fitness:
+                                continue
+
+                            seen_names.add(
+                                name.lower()
+                            )
+
+                            gyms.append({
+                                "name": name.strip(),
+                                "latitude": (
+                                    float(item["lat"])
+                                    if item.get("lat")
+                                    else None
+                                ),
+                                "longitude": (
+                                    float(item["lon"])
+                                    if item.get("lon")
+                                    else None
+                                ),
+                                "operator": None,
+                                "brand": None,
+                                "opening_hours": None,
+                                "phone": None,
+                                "website": None,
+                                "personal_trainer": None,
+                                "sport": None,
+                                "source": "OpenStreetMap"
+                            })
+
+                    except Exception as error:
+
+                        print(
+                            "Nominatim fallback error:",
+                            error
+                        )
+
+            # ------------------------------------------------
+            # REMOVE DUPLICATES
+            # ------------------------------------------------
+
+            unique_gyms = []
+            final_names = set()
+
+            for gym in gyms:
+
+                name = gym["name"].strip()
+                normalized = name.lower()
+
+                if normalized in final_names:
+                    continue
+
+                final_names.add(normalized)
+                unique_gyms.append(gym)
+
+            unique_gyms = unique_gyms[:30]
+
+            print(
+                f"Final real gym count for "
+                f"{location}: {len(unique_gyms)}"
+            )
+
+            gym_search_cache[cache_key] = (
+                time.time(),
+                unique_gyms
+            )
+
+            return unique_gyms
+
+    except httpx.TimeoutException:
+
+        print(
+            "OpenStreetMap request timed out."
+        )
+
+        return []
+
+    except Exception as error:
+
+        print(
+            f"Gym search error: {error}"
+        )
+
+        return []
+
+
+# ============================================================
+# AI GYM RECOMMENDER
+# ============================================================
+
+@app.post("/api/gyms/recommend")
+async def recommend_gyms(
+    request: GymRecommendationRequest,
+    db: Session = Depends(get_db)
+):
+
+    username = request.username.strip()
+    goal = request.goal.strip()
+    location = request.location.strip()
+
+    if not location:
+        raise HTTPException(
+            status_code=400,
+            detail="Location is required."
+        )
+
+    if not goal:
+        raise HTTPException(
+            status_code=400,
+            detail="Fitness goal is required."
+        )
+
+    # --------------------------------------------------------
+    # REAL GYMS
+    # --------------------------------------------------------
+
+    real_gyms = await find_real_gyms(
+        location,
+        request.latitude,
+        request.longitude
+    )
+
+    print(
+        f"Real gyms available for AI: "
+        f"{len(real_gyms)}"
+    )
+
+    gym_list_for_ai = []
+
+    for index, gym in enumerate(real_gyms):
+
+        gym_list_for_ai.append({
+            "id": index + 1,
+            "name": gym["name"],
+            "opening_hours": gym.get(
+                "opening_hours"
+            ),
+            "sport": gym.get(
+                "sport"
+            ),
+            "personal_trainer": gym.get(
+                "personal_trainer"
+            )
+        })
+
+    gyms_text = json.dumps(
+        gym_list_for_ai,
+        ensure_ascii=False,
+        indent=2
+    )
+
+    if real_gyms:
+
+        gym_instruction = f"""
+REAL GYMS FOUND FROM OPENSTREETMAP
+
+{gyms_text}
+
+IMPORTANT GYM RULES:
+
+- Only recommend gyms from this list.
+- Never invent a gym name.
+- Never create fake ratings.
+- Never claim a gym has equipment unless
+  the available data supports it.
+- If there are fewer than 3 suitable gyms,
+  return only the suitable gyms.
+"""
+
+    else:
+
+        gym_instruction = """
+No named gyms were found in OpenStreetMap
+for this location.
+
+Do not invent gym names.
+
+Return an empty recommended_gyms list.
+"""
+
+    # --------------------------------------------------------
+    # AI PROMPT
+    # --------------------------------------------------------
+
+    prompt = f"""
+You are the Gym Recommender AI inside AI.
+
+USER
+
+Username: {username}
+
+Location: {location}
+
+Fitness Goal: {goal}
+
+{gym_instruction}
+
+Create a personalized fitness plan.
+
+Return ONLY valid JSON.
+
+Use exactly this structure:
+
+{{
+    "workout_program": {{
+        "title": "",
+        "description": "",
+        "weekly_schedule": []
+    }},
+
+    "fitness_challenge": {{
+        "title": "",
+        "description": "",
+        "duration_days": 30
+    }},
+
+    "recommended_gyms": []
+}}
+
+For recommended_gyms use:
+
+[
+    {{
+        "name": "",
+        "reason": "",
+        "source": "OpenStreetMap"
+    }}
+]
+
+Do NOT invent:
+
+- age
+- height
+- weight
+- medical conditions
+- calorie requirements
+- protein requirements
+- dietary requirements
+
+Do not make up gym ratings.
+
+Keep the workout realistic and practical.
+"""
+
+    # --------------------------------------------------------
+    # OLLAMA
+    # --------------------------------------------------------
+
+    ai_response = await generate_response(
+        prompt
+    )
+
+    recommendations = None
+
+    try:
+
+        cleaned = ai_response.strip()
+
+        if cleaned.startswith("```"):
+
+            cleaned = cleaned.replace(
+                "```json",
+                ""
+            )
+
+            cleaned = cleaned.replace(
+                "```",
+                ""
+            )
+
+            cleaned = cleaned.strip()
+
+        recommendations = json.loads(
+            cleaned
+        )
+
+    except Exception as error:
+
+        print(
+            f"Gym AI JSON parsing failed: {error}"
+        )
+
+        recommendations = {
+            "workout_program": {
+                "title": f"{goal} Program",
+                "description": (
+                    "A personalized training program "
+                    "based on your selected fitness goal."
+                ),
+                "weekly_schedule": [
+                    "Day 1 - Strength Training",
+                    "Day 2 - Rest or Light Cardio",
+                    "Day 3 - Strength Training",
+                    "Day 4 - Rest",
+                    "Day 5 - Strength Training",
+                    "Day 6 - Optional Cardio",
+                    "Day 7 - Rest"
+                ]
+            },
+
+            "fitness_challenge": {
+                "title": (
+                    f"30-Day {goal} Challenge"
+                ),
+                "description": (
+                    "Stay consistent with your "
+                    "workouts for the next 30 days."
+                ),
+                "duration_days": 30
+            },
+
+            "recommended_gyms": []
+        }
+
+    # --------------------------------------------------------
+    # VERIFY GYMS
+    # --------------------------------------------------------
+
+    valid_gym_names = {
+        gym["name"].strip().lower()
+        for gym in real_gyms
+    }
+
+    verified_recommendations = []
+
+    ai_gyms = recommendations.get(
+        "recommended_gyms",
+        []
+    )
+
+    if isinstance(ai_gyms, list):
+
+        for gym in ai_gyms:
+
+            if not isinstance(gym, dict):
+                continue
+
+            name = str(
+                gym.get("name", "")
+            ).strip()
+
+            if not name:
+                continue
+
+            if name.lower() not in valid_gym_names:
+
+                print(
+                    f"Rejected invented gym: {name}"
+                )
+
+                continue
+
+            verified_recommendations.append(
+                gym
+            )
+
+    # --------------------------------------------------------
+    # FALLBACK
+    # --------------------------------------------------------
+
+    if (
+        not verified_recommendations
+        and real_gyms
+    ):
+
+        for gym in real_gyms[:3]:
+
+            verified_recommendations.append({
+                "name": gym["name"],
+                "reason": (
+                    f"Real fitness facility found "
+                    f"near {location}."
+                ),
+                "source": "OpenStreetMap"
+            })
+
+    recommendations[
+        "recommended_gyms"
+    ] = verified_recommendations
+
+    # --------------------------------------------------------
+    # RESPONSE
+    # --------------------------------------------------------
+
+    return {
+        "username": username,
+        "location": location,
+        "goal": goal,
+
+        "workout_program": recommendations.get(
+            "workout_program",
+            {}
+        ),
+
+        "fitness_challenge": recommendations.get(
+            "fitness_challenge",
+            {}
+        ),
+
+        "recommended_gyms":
+            verified_recommendations,
+
+        "gym_data_source":
+            "OpenStreetMap",
+
+        "real_gyms_found":
+            len(real_gyms)
+    }
+
+
+# ============================================================
+# PERFORMANCE - SAVE
+# ============================================================
+
+@app.post("/api/performance")
+def save_performance(
+    request: PerformanceRequest,
+    db: Session = Depends(get_db)
+):
+
+    username = request.username.strip()
+    exercise = request.exercise.strip()
+
+    if not username:
+        raise HTTPException(
+            status_code=400,
+            detail="Username is required."
+        )
+
+    if not exercise:
+        raise HTTPException(
+            status_code=400,
+            detail="Exercise is required."
+        )
+
+    score = max(
+        0,
+        min(100, request.score)
+    )
+
+    efficiency = max(
+        0,
+        min(100, request.motion_efficiency)
+    )
+
+    performance = models.PerformanceModel(
+        username=username,
+        exercise=exercise,
+        score=score,
+        motion_efficiency=efficiency,
+        completed_reps=max(
+            0,
+            request.completed_reps
+        ),
+        feedback=request.feedback
+    )
+
+    db.add(performance)
+    db.commit()
+    db.refresh(performance)
+
+    return {
+        "message":
+            "Performance saved successfully.",
+
+        "performance": {
+            "id": performance.id,
+            "username": performance.username,
+            "exercise": performance.exercise,
+            "score": performance.score,
+            "motion_efficiency":
+                performance.motion_efficiency,
+            "completed_reps":
+                performance.completed_reps,
+            "feedback":
+                performance.feedback,
+
+            "created_at": (
+                performance.created_at.isoformat()
+                if performance.created_at
+                else None
+            )
+        }
+    }
+
+
+# ============================================================
+# PERFORMANCE REPORT
+# ============================================================
+
+@app.get("/api/performance/report/{username}")
+def performance_report(
+    username: str,
+    db: Session = Depends(get_db)
+):
+
+    username = username.strip()
+
+    if not username:
+        raise HTTPException(
+            status_code=400,
+            detail="Username is required."
+        )
+
+    performances = (
+        db.query(models.PerformanceModel)
+        .filter(
+            models.PerformanceModel.username
+            == username
+        )
+        .order_by(
+            models.PerformanceModel.id.desc()
+        )
+        .all()
+    )
+
+    if not performances:
+
+        return {
+            "username": username,
+            "total_workouts": 0,
+            "average_score": 0,
+            "average_motion_efficiency": 0,
+            "total_reps": 0,
+            "records": []
+        }
+
+    total = len(performances)
+
+    average_score = (
+        sum(
+            p.score
+            for p in performances
+        )
+        / total
+    )
+
+    average_efficiency = (
+        sum(
+            p.motion_efficiency
+            for p in performances
+        )
+        / total
+    )
+
+    total_reps = sum(
+        p.completed_reps
+        for p in performances
+    )
+
+    records = []
+
+    for performance in performances:
+
+        records.append({
+            "id": performance.id,
+            "exercise": performance.exercise,
+            "score": performance.score,
+            "motion_efficiency":
+                performance.motion_efficiency,
+            "completed_reps":
+                performance.completed_reps,
+            "feedback":
+                performance.feedback,
+            "created_at": (
+                performance.created_at.isoformat()
+                if performance.created_at
+                else None
+            )
+        })
+
+    return {
+        "username": username,
+
+        "total_workouts": total,
+
+        "average_score": round(
+            average_score,
+            1
+        ),
+
+        "average_motion_efficiency":
+            round(
+                average_efficiency,
+                1
+            ),
+
+        "total_reps": total_reps,
+
+        "records": records
+    }
+
+
+# ============================================================
+# IOT - STATUS
+# ============================================================
+
+@app.get("/api/iot/status")
+def get_iot_status():
+
+    return {
+        "status": "connected",
+        "resistance_level":
+            iot_state["resistance_level"],
+        "intensity":
+            iot_state["intensity"],
+        "rest_seconds":
+            iot_state["rest_seconds"],
+        "last_adjustment":
+            iot_state["last_adjustment"]
+    }
+
+
+# ============================================================
+# IOT - ADJUST RESISTANCE
+# ============================================================
+
+@app.post("/api/iot/adjust-resistance")
+def adjust_resistance(
+    request: ResistanceRequest
+):
+
+    resistance = max(
+        1,
+        min(
+            20,
+            request.resistance_level
+        )
+    )
+
+    iot_state[
+        "resistance_level"
+    ] = resistance
+
+    if resistance <= 5:
+        intensity = "Light"
+
+    elif resistance <= 10:
+        intensity = "Moderate"
+
+    elif resistance <= 15:
+        intensity = "High"
+
+    else:
+        intensity = "Very High"
+
+    iot_state[
+        "intensity"
+    ] = intensity
+
+    iot_state[
+        "last_adjustment"
+    ] = time.time()
+
+    return {
+        "message":
+            "Resistance adjusted.",
+        "resistance_level":
+            resistance,
+        "intensity":
+            intensity
+    }
+
+
+# ============================================================
+# IOT - AI RECOMMENDATION
+# ============================================================
+
+@app.get("/api/iot/recommendation")
+async def iot_recommendation(
+    username: str = "guest"
+):
+
+    username = username.strip()
+
+    if not username:
+        username = "guest"
+
+    recommendation_prompt = f"""
+You are a smart gym equipment assistant.
+
+User:
+{username}
+
+Current resistance:
+{iot_state["resistance_level"]}
+
+Current intensity:
+{iot_state["intensity"]}
+
+Provide a short recommendation for:
+
+1. Resistance
+2. Rest period
+3. Training intensity
+
+Do not invent user medical information.
+
+Return practical general fitness guidance.
+"""
+
+    response = await generate_response(
+        recommendation_prompt
+    )
+
+    return {
+        "username": username,
+        "current_resistance":
+            iot_state["resistance_level"],
+        "current_intensity":
+            iot_state["intensity"],
+        "recommendation":
+            response
+    }
+
+
+# ============================================================
+# AI COACH TIP
+# ============================================================
+
+@app.post("/api/coach-tip")
+async def coach_tip(
+    request: PromptRequest,
+    username: str = "guest",
+    db: Session = Depends(get_db)
+):
+
+    username = username.strip() or "guest"
+
+    # Use the logged-in user's actual context.
+    context = build_user_context(
+        username=username,
+        db=db
+    )
+
+    prompt = f"""
+You are the central AI fitness assistant
+for AI Platform.
+
+The current logged-in user is:
+
+{username}
+
+Use the following user context:
+
+{context}
+
+USER REQUEST
+------------
+
+{request.prompt}
+
+INSTRUCTIONS
+
+Give practical and useful fitness guidance.
+
+Use the available user context when relevant.
+
+Do not invent information about the user.
+
+Keep the response concise unless the
+user asks for detail.
+
+Do not mention internal system architecture.
+
+Do not mention Ollama.
+"""
+
+    response = await generate_response(
+        prompt
+    )
+
+    return {
+        "advice": response
+    }
+
+
+# ============================================================
+# AI GYM BUDDY CHAT
+# ============================================================
+
+@app.post("/api/chat")
+async def chat(
+    request: ChatRequest,
+    db: Session = Depends(get_db)
+):
+
+    username = request.username.strip()
+    message = request.message.strip()
+
+    # --------------------------------------------------------
+    # VALIDATION
+    # --------------------------------------------------------
+
+    if not username:
+        raise HTTPException(
+            status_code=400,
+            detail="Username is required."
+        )
+
+    if not message:
+        raise HTTPException(
+            status_code=400,
+            detail="Message is required."
+        )
+
+    # --------------------------------------------------------
+    # SAVE USER MESSAGE
+    # --------------------------------------------------------
+
+    try:
+
+        user_message = models.ChatMessageModel(
+            username=username,
+            sender="user",
+            message=message
+        )
+
+        db.add(user_message)
+        db.commit()
+
+    except Exception as error:
+
+        db.rollback()
+
+        print(
+            "Database error while saving "
+            f"user message: {error}"
+        )
+
+    # --------------------------------------------------------
+    # BUILD USER CONTEXT
+    # --------------------------------------------------------
+
+    context = build_user_context(
+        username=username,
+        db=db
+    )
+
+    # --------------------------------------------------------
+    # AI PROMPT
+    # --------------------------------------------------------
+
+    prompt = f"""
+You are AI, an intelligent
+personal fitness assistant.
+
+You act as:
+
+- AI Gym Trainer
+- AI Dietician
+- Fitness Habit Coach
+- Workout Assistant
+- Performance Coach
+- Virtual Gym Buddy
+
+The following information belongs to
+the CURRENT logged-in user.
+
+============================================================
+USER CONTEXT
+============================================================
+
+{context}
+
+============================================================
+CURRENT USER
+============================================================
+
+{username}
+
+============================================================
+CURRENT USER MESSAGE
+============================================================
+
+{message}
+
+============================================================
+INSTRUCTIONS
+============================================================
+
+Answer naturally and practically.
+
+Use available user context when relevant.
+
+Maintain continuity with previous
+conversations when useful.
+
+Use recent meal information when answering
+nutrition questions.
+
+Use habit information when discussing
+fitness consistency and motivation.
+
+Use workout performance information when
+discussing recorded workout progress.
+
+Do NOT invent:
+
+- weight
+- height
+- age
+- fitness goals
+- diet preferences
+- workout history
+- medical information
+- performance data
+- habits
+- meals
+
+unless that information is actually available.
+
+If information is unavailable, say that you
+do not have that information yet.
+
+For fitness questions, provide safe general
+guidance.
+
+For nutrition questions, provide general
+nutritional guidance without pretending to
+know exact nutritional requirements.
+
+For motivation, be encouraging without
+being repetitive.
+
+Keep responses reasonably concise unless
+the user asks for detail.
+
+Do not mention:
+
+- database
+- context engine
+- system prompt
+- internal architecture
+- Ollama
+- implementation details
+
+Speak naturally as the user's AI fitness
+companion.
+"""
+
+    # --------------------------------------------------------
+    # GENERATE AI RESPONSE
+    # --------------------------------------------------------
+
+    try:
+
+        reply = await generate_response(
+            prompt
+        )
+
+    except Exception as error:
+
+        print(
+            f"LLM Error: {error}"
+        )
+
+        reply = (
+            "I'm having trouble connecting "
+            "to my AI service right now. "
+            "Please try again in a moment."
+        )
+
+    # --------------------------------------------------------
+    # SAVE AI RESPONSE
+    # --------------------------------------------------------
+
+    try:
+
+        ai_message = models.ChatMessageModel(
+            username=username,
+            sender="buddy",
+            message=reply
+        )
+
+        db.add(ai_message)
+        db.commit()
+
+    except Exception as error:
+
+        db.rollback()
+
+        print(
+            "Database error while saving "
+            f"AI response: {error}"
+        )
+
+    # --------------------------------------------------------
+    # RETURN
+    # --------------------------------------------------------
+
+    return {
+        "reply": reply
+    }
+    
+# ============================================================
+# ADMIN DASHBOARD ANALYTICS
+# ============================================================
+
+@app.get("/api/admin/dashboard")
+def admin_dashboard(
+    db: Session = Depends(get_db)
+):
+
+    try:
+
+        # ----------------------------------------------------
+        # USERS
+        # ----------------------------------------------------
+
+        total_users = (
+            db.query(models.UserModel)
+            .count()
+        )
+
+        recent_users = (
+            db.query(models.UserModel)
+            .order_by(
+                models.UserModel.id.desc()
+            )
+            .limit(10)
+            .all()
+        )
+
+        # ----------------------------------------------------
+        # MEALS
+        # ----------------------------------------------------
+
+        total_meals = (
+            db.query(models.MealModel)
+            .count()
+        )
+
+        total_calories = (
+            db.query(
+                models.MealModel.calories
+            )
+            .all()
+        )
+
+        total_protein = (
+            db.query(
+                models.MealModel.protein
+            )
+            .all()
+        )
+
+        total_carbs = (
+            db.query(
+                models.MealModel.carbs
+            )
+            .all()
+        )
+
+        total_fats = (
+            db.query(
+                models.MealModel.fats
+            )
+            .all()
+        )
+
+        calories_sum = sum(
+            float(row[0] or 0)
+            for row in total_calories
+        )
+
+        protein_sum = sum(
+            float(row[0] or 0)
+            for row in total_protein
+        )
+
+        carbs_sum = sum(
+            float(row[0] or 0)
+            for row in total_carbs
+        )
+
+        fats_sum = sum(
+            float(row[0] or 0)
+            for row in total_fats
+        )
+
+        # ----------------------------------------------------
+        # HABITS
+        # ----------------------------------------------------
+
+        total_habits = (
+            db.query(models.HabitModel)
+            .count()
+        )
+
+        completed_habits = (
+            db.query(models.HabitModel)
+            .filter(
+                models.HabitModel.completed == True
+            )
+            .count()
+        )
+
+        pending_habits = (
+            total_habits -
+            completed_habits
+        )
+
+        if total_habits > 0:
+            completion_rate = (
+                completed_habits /
+                total_habits
+            ) * 100
+        else:
+            completion_rate = 0
+
+        # ----------------------------------------------------
+        # PERFORMANCE
+        # ----------------------------------------------------
+
+        total_performance_records = (
+            db.query(models.PerformanceModel)
+            .count()
+        )
+
+        performance_records = (
+            db.query(models.PerformanceModel)
+            .all()
+        )
+
+        if performance_records:
+
+            average_score = (
+                sum(
+                    float(
+                        item.score or 0
+                    )
+                    for item in performance_records
+                )
+                /
+                len(performance_records)
+            )
+
+            average_motion_efficiency = (
+                sum(
+                    float(
+                        item.motion_efficiency or 0
+                    )
+                    for item in performance_records
+                )
+                /
+                len(performance_records)
+            )
+
+            total_reps = sum(
+                int(
+                    item.completed_reps or 0
+                )
+                for item in performance_records
+            )
+
+            unique_exercises = len(
+                set(
+                    item.exercise
+                    for item in performance_records
+                    if item.exercise
+                )
+            )
+
+        else:
+
+            average_score = 0
+            average_motion_efficiency = 0
+            total_reps = 0
+            unique_exercises = 0
+
+        # ----------------------------------------------------
+        # EXERCISE BREAKDOWN
+        # ----------------------------------------------------
+
+        exercise_map = {}
+
+        for item in performance_records:
+
+            exercise_name = (
+                item.exercise or
+                "Unknown"
+            )
+
+            if exercise_name not in exercise_map:
+
+                exercise_map[
+                    exercise_name
+                ] = {
+                    "exercise": exercise_name,
+                    "sessions": 0,
+                    "total_score": 0,
+                    "total_motion_efficiency": 0,
+                    "total_reps": 0
+                }
+
+            entry = exercise_map[
+                exercise_name
+            ]
+
+            entry["sessions"] += 1
+
+            entry["total_score"] += float(
+                item.score or 0
+            )
+
+            entry[
+                "total_motion_efficiency"
+            ] += float(
+                item.motion_efficiency or 0
+            )
+
+            entry["total_reps"] += int(
+                item.completed_reps or 0
+            )
+
+        exercise_breakdown = []
+
+        for entry in exercise_map.values():
+
+            sessions = entry["sessions"]
+
+            exercise_breakdown.append({
+
+                "exercise":
+                    entry["exercise"],
+
+                "sessions":
+                    sessions,
+
+                "average_score":
+                    round(
+                        entry["total_score"] /
+                        sessions,
+                        2
+                    ),
+
+                "average_motion_efficiency":
+                    round(
+                        entry[
+                            "total_motion_efficiency"
+                        ] /
+                        sessions,
+                        2
+                    ),
+
+                "total_reps":
+                    entry["total_reps"]
+
+            })
+
+        exercise_breakdown.sort(
+            key=lambda x: x["sessions"],
+            reverse=True
+        )
+
+        # ----------------------------------------------------
+        # CHAT
+        # ----------------------------------------------------
+
+        total_chat_messages = (
+            db.query(
+                models.ChatMessageModel
+            )
+            .count()
+        )
+
+        # ----------------------------------------------------
+        # ACTIVE USERS
+        #
+        # A user is considered active if they have at least
+        # one meal, habit, performance record or chat message.
+        # ----------------------------------------------------
+
+        active_usernames = set()
+
+        meal_users = (
+            db.query(
+                models.MealModel.username
+            )
+            .all()
+        )
+
+        habit_users = (
+            db.query(
+                models.HabitModel.username
+            )
+            .all()
+        )
+
+        performance_users = (
+            db.query(
+                models.PerformanceModel.username
+            )
+            .all()
+        )
+
+        chat_users = (
+            db.query(
+                models.ChatMessageModel.username
+            )
+            .all()
+        )
+
+        for row in meal_users:
+            if row[0]:
+                active_usernames.add(row[0])
+
+        for row in habit_users:
+            if row[0]:
+                active_usernames.add(row[0])
+
+        for row in performance_users:
+            if row[0]:
+                active_usernames.add(row[0])
+
+        for row in chat_users:
+            if row[0]:
+                active_usernames.add(row[0])
+
+        # ----------------------------------------------------
+        # RECENT PERFORMANCE
+        # ----------------------------------------------------
+
+        recent_performance = (
+            db.query(
+                models.PerformanceModel
+            )
+            .order_by(
+                models.PerformanceModel.id.desc()
+            )
+            .limit(10)
+            .all()
+        )
+
+        recent_performance_data = []
+
+        for item in recent_performance:
+
+            recent_performance_data.append({
+
+                "username":
+                    item.username,
+
+                "exercise":
+                    item.exercise,
+
+                "score":
+                    round(
+                        float(
+                            item.score or 0
+                        ),
+                        2
+                    ),
+
+                "motion_efficiency":
+                    round(
+                        float(
+                            item.motion_efficiency or 0
+                        ),
+                        2
+                    ),
+
+                "completed_reps":
+                    int(
+                        item.completed_reps or 0
+                    ),
+
+                "feedback":
+                    item.feedback or "",
+
+                "created_at":
+                    (
+                        item.created_at.isoformat()
+                        if item.created_at
+                        else None
+                    )
+
+            })
+
+        # ----------------------------------------------------
+        # RETURN DASHBOARD DATA
+        # ----------------------------------------------------
+
+        return {
+
+            "status": "success",
+
+            "statistics": {
+
+                "total_users":
+                    total_users,
+
+                "active_users":
+                    len(active_usernames),
+
+                "total_meals":
+                    total_meals,
+
+                "total_habits":
+                    total_habits,
+
+                "total_performance_records":
+                    total_performance_records,
+
+                "total_chat_messages":
+                    total_chat_messages
+
+            },
+
+            "nutrition": {
+
+                "total_calories":
+                    round(
+                        calories_sum,
+                        2
+                    ),
+
+                "total_protein":
+                    round(
+                        protein_sum,
+                        2
+                    ),
+
+                "total_carbs":
+                    round(
+                        carbs_sum,
+                        2
+                    ),
+
+                "total_fats":
+                    round(
+                        fats_sum,
+                        2
+                    )
+
+            },
+
+            "habits": {
+
+                "total_habits":
+                    total_habits,
+
+                "completed_habits":
+                    completed_habits,
+
+                "pending_habits":
+                    pending_habits,
+
+                "completion_rate":
+                    round(
+                        completion_rate,
+                        2
+                    )
+
+            },
+
+            "performance": {
+
+                "average_score":
+                    round(
+                        average_score,
+                        2
+                    ),
+
+                "average_motion_efficiency":
+                    round(
+                        average_motion_efficiency,
+                        2
+                    ),
+
+                "total_reps":
+                    total_reps,
+
+                "unique_exercises":
+                    unique_exercises,
+
+                "exercise_breakdown":
+                    exercise_breakdown
+
+            },
+
+            "recent_users": [
+
+                {
+                    "id":
+                        user.id,
+
+                    "username":
+                        user.username
+
+                }
+
+                for user in recent_users
+
+            ],
+
+            "recent_performance":
+                recent_performance_data,
+
+            "system": {
+
+                "backend":
+                    "Online",
+
+                "database":
+                    "Online",
+
+                "ai_service":
+                    "Online",
+
+                "analytics":
+                    "Online"
+
+            }
+
+        }
+
+    except Exception as e:
+
+        print(
+            f"Admin dashboard error: {e}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Failed to generate "
+                "admin dashboard analytics."
+            )
+        )
