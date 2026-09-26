@@ -10,7 +10,7 @@ export default function AdminDashboard() {
     setError("");
 
     try {
-      const response = await fetch("/api/admin/dashboard");
+      const response = await fetch(`${API_URL}/api/admin/dashboard`);
 
       if (!response.ok) {
         throw new Error(`Server error: ${response.status}`);
@@ -90,7 +90,7 @@ export default function AdminDashboard() {
 
           <div>
             <span className="text-[11px] font-semibold text-[#c29b61] uppercase tracking-wider">
-              Trivion AI
+              AI Platform
             </span>
 
             <h1 className="text-2xl font-bold mt-1">
@@ -585,7 +585,7 @@ export default function AdminDashboard() {
             </span>
 
             <h2 className="text-base font-bold mt-1">
-              Trivion AI Platform Status
+              AI Platform Status
             </h2>
           </div>
 

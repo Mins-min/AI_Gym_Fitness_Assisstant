@@ -3,6 +3,8 @@ import React, {
   useState
 } from 'react';
 
+import { API_URL } from '../api';
+
 
 export default function SmartGymIoT({ username }) {
 
@@ -81,7 +83,7 @@ export default function SmartGymIoT({ username }) {
 
       const response =
         await fetch(
-          '/api/iot/status'
+          `${API_URL}/api/iot/status`
         );
 
       const data =
@@ -145,7 +147,7 @@ export default function SmartGymIoT({ username }) {
 
       const response =
         await fetch(
-          '/api/iot/adjust-resistance',
+          `${API_URL}/api/iot/adjust-resistance`,
           {
             method: 'POST',
 
@@ -246,7 +248,7 @@ export default function SmartGymIoT({ username }) {
 
       const response =
         await fetch(
-          `/api/iot/recommendation${query}`,
+          `${API_URL}/api/iot/recommendation${query}`,
           {
             method: 'GET'
           }

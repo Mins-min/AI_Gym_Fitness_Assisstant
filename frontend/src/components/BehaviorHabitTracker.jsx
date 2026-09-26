@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { API_URL } from '../api';
 
 export default function BehaviorHabitTracker() {
   const [habitsData, setHabitsData] = useState({

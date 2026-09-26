@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { API_URL } from "../api";
 
 export default function GymBuddyChat({ username = "guest" }) {
   const [input, setInput] = useState("");
@@ -33,7 +34,7 @@ export default function GymBuddyChat({ username = "guest" }) {
     setLoading(true);
 
     try {
-      const response = await fetch("/api/chat", {
+      const response = await fetch(`${API_URL}/api/chat`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -69,7 +70,7 @@ export default function GymBuddyChat({ username = "guest" }) {
         {
           role: "assistant",
           content:
-            "⚠️ I couldn't connect to the AI service. Please make sure your FastAPI backend and Ollama are running.",
+            "⚠️ I couldn't connect to the AI service. Please try again.",
         },
       ]);
     } finally {
@@ -83,30 +84,41 @@ export default function GymBuddyChat({ username = "guest" }) {
 
         {/* HEADER */}
         <div className="flex items-center justify-between px-6 py-5 border-b border-[#292524]">
+
           <div>
             <div className="flex items-center gap-2">
-              <span className="text-xl">🤖</span>
+
+              <span className="text-xl">
+                🤖
+              </span>
 
               <h2 className="text-sm font-bold uppercase tracking-wider text-[#c29b61]">
                 Virtual Gym Buddy
               </h2>
+
             </div>
 
             <p className="text-[10px] text-[#78716c] mt-1">
-              Powered by Trivion AI • Llama 3.2
+              Powered by AI • Llama 3.2
             </p>
           </div>
 
           <div className="flex items-center gap-2 text-[10px] text-green-400">
+
             <span className="w-2 h-2 rounded-full bg-green-400"></span>
+
             AI ONLINE
+
           </div>
+
         </div>
+
 
         {/* MESSAGES */}
         <div className="flex-1 overflow-y-auto p-5 space-y-4">
 
           {messages.map((message, index) => (
+
             <div
               key={index}
               className={`flex ${
@@ -115,6 +127,7 @@ export default function GymBuddyChat({ username = "guest" }) {
                   : "justify-start"
               }`}
             >
+
               <div
                 className={`max-w-[82%] px-4 py-3 rounded-2xl text-xs leading-relaxed ${
                   message.role === "user"
@@ -122,31 +135,47 @@ export default function GymBuddyChat({ username = "guest" }) {
                     : "bg-[#221f1d] border border-[#292524] text-[#e7e5e4] rounded-bl-md"
                 }`}
               >
+
                 {message.content}
+
               </div>
+
             </div>
+
           ))}
 
+
           {loading && (
+
             <div className="flex justify-start">
+
               <div className="bg-[#221f1d] border border-[#292524] px-4 py-3 rounded-2xl rounded-bl-md text-xs text-[#a8a29e]">
+
                 <span className="animate-pulse">
                   Gym Buddy is thinking...
                 </span>
+
               </div>
+
             </div>
+
           )}
+
         </div>
+
 
         {/* INPUT */}
         <form
           onSubmit={handleSubmit}
           className="p-4 border-t border-[#292524] flex gap-2"
         >
+
           <input
             type="text"
             value={input}
-            onChange={(e) => setInput(e.target.value)}
+            onChange={(e) =>
+              setInput(e.target.value)
+            }
             placeholder="Ask your AI Gym Buddy..."
             disabled={loading}
             className="flex-1 bg-[#221f1d] border border-[#292524] focus:border-[#c29b61] rounded-xl px-4 py-3 text-xs text-[#e7e5e4] outline-none disabled:opacity-50"
@@ -157,8 +186,11 @@ export default function GymBuddyChat({ username = "guest" }) {
             disabled={loading || !input.trim()}
             className="bg-[#c29b61] hover:bg-[#b08852] disabled:opacity-40 text-[#141210] font-bold px-6 rounded-xl text-xs transition-colors"
           >
+
             {loading ? "..." : "Send"}
+
           </button>
+
         </form>
 
       </div>

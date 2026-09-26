@@ -9,6 +9,8 @@ import {
   PoseLandmarker
 } from '@mediapipe/tasks-vision';
 
+import { API_URL } from "../api";
+
 
 export default function RepCounterFeed({
   username
@@ -496,8 +498,7 @@ export default function RepCounterFeed({
 
 
       const response =
-        await fetch(
-          '/api/coach-tip',
+        await fetch(`${API_URL}/api/coach-tip`,
           {
             method: 'POST',
 
@@ -1782,7 +1783,7 @@ export default function RepCounterFeed({
       try {
 
         await fetch(
-          '/api/performance',
+          `${API_URL}/api/performance`,
           {
             method: 'POST',
 
