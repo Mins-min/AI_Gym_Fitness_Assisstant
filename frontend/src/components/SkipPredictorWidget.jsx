@@ -1,7 +1,5 @@
-import React, {
-    useEffect,
-    useState
-} from "react";
+import { API_URL } from "../api";
+import React, { useEffect, useState } from "react";
 
 
 export default function SkipPredictorWidget({
@@ -37,9 +35,9 @@ export default function SkipPredictorWidget({
         try {
 
             const response =
-                await fetch(
-                    `http://localhost:8000/api/habits?username=${encodeURIComponent(username)}`
-                );
+              await fetch(
+              `${API_URL}/api/habits?username=${encodeURIComponent(username)}`
+           );
 
             const data =
                 await response.json();
@@ -76,7 +74,7 @@ export default function SkipPredictorWidget({
 
             const response =
                 await fetch(
-                    "http://localhost:8000/api/habits",
+                    `${API_URL}/api/habits`,
                     {
                         method: "POST",
 
@@ -123,7 +121,7 @@ export default function SkipPredictorWidget({
         try {
 
             await fetch(
-                `http://localhost:8000/api/habits/${habit.id}?completed=${!habit.completed}&username=${encodeURIComponent(username)}`,
+                `${API_URL}/api/habits/${habit.id}?completed=${!habit.completed}&username=${encodeURIComponent(username)}`,
                 {
                     method: "PUT"
                 }
@@ -163,7 +161,7 @@ export default function SkipPredictorWidget({
 
             const response =
                 await fetch(
-                    "http://localhost:8000/api/behavior/advanced-predict",
+                    `${API_URL}/api/behavior/advanced-predict`,
                     {
                         method: "POST",
 
